@@ -1,0 +1,26 @@
+[
+  {
+    "id": "matter",
+    "title": "Matter",
+    "summary": "Matter is anything that has mass and occupies space. Everything around us is made of matter.",
+    "sample_question": "What are the three main states of matter?"
+  },
+  {
+    "id": "force",
+    "title": "Force",
+    "summary": "A force is a push or pull acting on an object. It can change an object's motion, speed, or direction.",
+    "sample_question": "What is the SI unit of force?"
+  },
+  {
+    "id": "energy",
+    "title": "Energy",
+    "summary": "Energy is the ability to do work or cause change. It exists in different forms like kinetic, potential, heat, and light.",
+    "sample_question": "What is the difference between kinetic and potential energy?"
+  },
+  {
+    "id": "gravity",
+    "title": "Gravity",
+    "summary": "Gravity is the force that attracts objects towards the center of the Earth or any other mass.",
+    "sample_question": "Why do objects fall toward the ground?"
+  }
+]
