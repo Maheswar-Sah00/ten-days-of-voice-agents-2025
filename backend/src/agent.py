@@ -1,10 +1,27 @@
-import logging
+# IMPROVE THE AGENT AS PER YOUR NEED 1
+"""
+Day 8 – Voice Game Master (D&D-Style Adventure) - Voice-only GM agent
+
+- Uses LiveKit agent plumbing similar to the provided food_agent_sqlite example.
+- GM persona, universe, tone and rules are encoded in the agent instructions.
+- Keeps STT/TTS/Turn detector/VAD integration untouched (murf, deepgram, silero, turn_detector).
+- Tools:
+    - start_adventure(): start a fresh session and introduce the scene
+    - get_scene(): return the current scene description (GM text) ending with "What do you do?"
+    - player_action(action_text): accept player's spoken action, update state, advance scene
+    - show_journal(): list remembered facts, NPCs, named locations, choices
+    - restart_adventure(): reset state and start over
+- Userdata keeps continuity between turns: history, inventory, named NPCs/locations, choices, current_scene
+"""
+
 import json
+import logging
 import os
 import asyncio
-from datetime import datetime
-from typing import Annotated, Literal
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Dict, Optional, Annotated
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -16,358 +33,616 @@ from livekit.agents import (
     RoomInputOptions,
     WorkerOptions,
     cli,
-    tokenize,
-    metrics,
-    MetricsCollectedEvent,
-    RunContext,
     function_tool,
+    RunContext,
 )
 
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("voice_game_master")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
+
 load_dotenv(".env.local")
 
-# ======================================================
-# 🛒 ORDER MANAGEMENT SYSTEM
-# ======================================================
-@dataclass
-class OrderState:
-    """☕ Coffee shop order state with validation"""
-    drinkType: str | None = None
-    size: str | None = None
-    milk: str | None = None
-    extras: list[str] = field(default_factory=list)
-    name: str | None = None
-    
-    def is_complete(self) -> bool:
-        """✅ Check if all required fields are filled"""
-        return all([
-            self.drinkType is not None,
-            self.size is not None,
-            self.milk is not None,
-            self.extras is not None,
-            self.name is not None
-        ])
-    
-    def to_dict(self) -> dict:
-        """📦 Convert to dictionary for JSON serialization"""
-        return {
-            "drinkType": self.drinkType,
-            "size": self.size,
-            "milk": self.milk,
-            "extras": self.extras,
-            "name": self.name
-        }
-    
-    def get_summary(self) -> str:
-        """📋 Get friendly order summary"""
-        if not self.is_complete():
-            return "🔄 Order in progress..."
-        
-        extras_text = f" with {', '.join(self.extras)}" if self.extras else ""
-        return f"☕ {self.size.upper()} {self.drinkType.title()} with {self.milk.title()} milk{extras_text} for {self.name}"
+# -------------------------
+# Simple Game World Definition
+# -------------------------
+# A compact world with a few scenes and choices forming a mini-arc.
+WORLD = {
+    "intro": {
+        "title": "An F-Rank Gate Opens",
+        "desc": (
+            "You awaken on the cracked floor of a newly-appeared F-Rank Gate. "
+            "Mana mist surrounds you, shimmering in hues of blue. A ruined outpost tower "
+            "smolders a short distance inland, its barrier crystals shattered. A narrow path leads "
+            "toward a cluster of abandoned hunter cottages to the east. "
+            "Beside you in the dust lies a faintly glowing System Cube, half-buried."
+        ),
+        "choices": {
+            "inspect_box": {
+                "desc": "Examine the glowing System Cube.",
+                "result_scene": "box",
+            },
+            "approach_tower": {
+                "desc": "Walk toward the damaged hunter watchtower.",
+                "result_scene": "tower",
+            },
+            "walk_to_cottages": {
+                "desc": "Follow the path east toward the deserted cottages.",
+                "result_scene": "cottages",
+            },
+        },
+    },
 
+    "box": {
+        "title": "The System Cube",
+        "desc": (
+            "The cube hums softly with mana. When you touch it, a holographic map flashes into view—"
+            "a dungeon layout with a marked symbol: 'Beneath the tower, the key resonates.' "
+            "As you study it, the cracked tower emits a faint pulse, almost calling your name."
+        ),
+        "choices": {
+            "take_map": {
+                "desc": "Absorb the System map into your interface.",
+                "result_scene": "tower_approach",
+                "effects": {
+                    "add_journal": "Obtained System Map: 'Beneath the tower, the key resonates.'"
+                },
+            },
+            "leave_box": {
+                "desc": "Leave the cube untouched.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "tower": {
+        "title": "Hunter Watchtower",
+        "desc": (
+            "The watchtower’s walls are cracked and glowing embers flicker inside. At its base lies "
+            "an old mana-sealed hatch with an iron latch—ancient, but recently disturbed. "
+            "You may try the latch blindly, search for another way in, or retreat."
+        ),
+        "choices": {
+            "try_latch_without_map": {
+                "desc": "Attempt to open the mana latch without any clue.",
+                "result_scene": "latch_fail",
+            },
+            "search_around": {
+                "desc": "Search the rubble for alternate dungeon entrances.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Return to the Gate’s entrance.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "tower_approach": {
+        "title": "Approaching the Tower",
+        "desc": (
+            "With the System Map guiding you, you approach the watchtower. The holographic markings align "
+            "perfectly with the hatch. As you near it, you hear a faint mana resonance—almost like the latch is singing."
+        ),
+        "choices": {
+            "open_hatch": {
+                "desc": "Use the clue to carefully unlock the mana latch.",
+                "result_scene": "latch_open",
+                "effects": {
+                    "add_journal": "Used System Map clue to unlock the dungeon hatch."
+                },
+            },
+            "search_around": {
+                "desc": "Search for other hidden mana entrances.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Return to the Gate’s starting point.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "latch_fail": {
+        "title": "Mana Backlash",
+        "desc": (
+            "You force the latch carelessly. The mana seal reacts violently—sending a tremor through the ground. "
+            "Something large stirs inside the tower, awakened by your mistake."
+        ),
+        "choices": {
+            "run_away": {
+                "desc": "Retreat quickly back to the Gate entrance.",
+                "result_scene": "intro",
+            },
+            "stand_ground": {
+                "desc": "Stay and prepare to fight whatever emerges.",
+                "result_scene": "tower_combat",
+            },
+        },
+    },
+
+    "latch_open": {
+        "title": "Dungeon Access Granted",
+        "desc": (
+            "Following the System Map’s instructions, the latch opens with a click. A rush of cold mana escapes. "
+            "A spiral staircase carved from stone descends into an underground dungeon chamber, lit by glowing mana moss."
+        ),
+        "choices": {
+            "descend": {
+                "desc": "Enter the dungeon’s lower chamber.",
+                "result_scene": "cellar",
+            },
+            "close_hatch": {
+                "desc": "Close the hatch and reconsider.",
+                "result_scene": "tower_approach",
+            },
+        },
+    },
+
+    "secret_entrance": {
+        "title": "Hidden Path",
+        "desc": (
+            "Behind collapsed rubble, you discover a narrow crawlspace. An old hunter rope leads downward—"
+            "the air is thick with mana and the scent of iron. Something lurks deeper inside."
+        ),
+        "choices": {
+            "squeeze_in": {
+                "desc": "Enter the hidden tunnel.",
+                "result_scene": "cellar",
+            },
+            "mark_and_return": {
+                "desc": "Mark the tunnel for later.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "cellar": {
+        "title": "Mana Chamber",
+        "desc": (
+            "You enter a circular underground room. Runes glow faintly across the walls. "
+            "In the center stands a stone pedestal holding a brass Dungeon Key and a sealed System Scroll."
+        ),
+        "choices": {
+            "take_key": {
+                "desc": "Take the Dungeon Key.",
+                "result_scene": "cellar_key",
+                "effects": {
+                    "add_inventory": "dungeon_key",
+                    "add_journal": "Obtained Dungeon Key from mana pedestal."
+                },
+            },
+            "open_scroll": {
+                "desc": "Break the System seal and read the scroll.",
+                "result_scene": "scroll_reveal",
+                "effects": {
+                    "add_journal": "System Scroll: 'The water beast guards what hunters once lost.'"
+                },
+            },
+            "leave_quietly": {
+                "desc": "Leave the chamber and close the hatch.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "cellar_key": {
+        "title": "Key Resonance",
+        "desc": (
+            "As you hold the key, the runes dim. A hidden door opens, revealing a statue of an ancient S-Rank hunter. "
+            "The statue glows and speaks: 'Will you return what was taken from this Gate?'"
+        ),
+        "choices": {
+            "pledge_help": {
+                "desc": "Pledge to restore what was lost.",
+                "result_scene": "reward",
+                "effects": {
+                    "add_journal": "You pledged to resolve the Gate’s disturbance."
+                },
+            },
+            "refuse": {
+                "desc": "Pocket the key without answering.",
+                "result_scene": "cursed_key",
+                "effects": {
+                    "add_journal": "You kept the key—its mana feels heavy and corrupted."
+                },
+            },
+        },
+    },
+
+    "scroll_reveal": {
+        "title": "System Scroll",
+        "desc": (
+            "The scroll reveals lore: a hunter heirloom was stolen by a water-type dungeon beast lurking beneath the tower. "
+            "It hints that the Dungeon Key will react when used truthfully."
+        ),
+        "choices": {
+            "search_for_key": {
+                "desc": "Search the pedestal for the key.",
+                "result_scene": "cellar_key",
+            },
+            "leave_quietly": {
+                "desc": "Leave with the information.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "tower_combat": {
+        "title": "Dungeon Beast Emerges",
+        "desc": (
+            "A scaled, mana-soaked creature crawls from the tower’s shadows. Its eyes burn crimson. "
+            "Its claws drip with corrupted water mana. It lunges at you."
+        ),
+        "choices": {
+            "fight": {
+                "desc": "Fight the dungeon beast.",
+                "result_scene": "fight_win",
+            },
+            "flee": {
+                "desc": "Retreat to the Gate’s entrance.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "fight_win": {
+        "title": "Victory",
+        "desc": (
+            "You defeat the creature. As it dissolves into mana particles, it drops a small engraved Hunter Locket—"
+            "matching the relic described in the System Scroll."
+        ),
+        "choices": {
+            "take_locket": {
+                "desc": "Take the Hunter Locket.",
+                "result_scene": "reward",
+                "effects": {
+                    "add_inventory": "hunter_locket",
+                    "add_journal": "Recovered lost Hunter Locket."
+                },
+            },
+            "leave_locket": {
+                "desc": "Leave it behind and rest.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "reward": {
+        "title": "Gate Stabilized",
+        "desc": (
+            "A calm wave of mana spreads across the Gate. The distortion fades. "
+            "A faint System message appears: 'Disturbance resolved. Mini-Arc Complete.' "
+            "But the Gate remains vast—there are more secrets waiting inside."
+        ),
+        "choices": {
+            "end_session": {
+                "desc": "End here and return to the Gate entrance.",
+                "result_scene": "intro",
+            },
+            "keep_exploring": {
+                "desc": "Continue exploring the dungeon.",
+                "result_scene": "intro",
+            },
+        },
+    },
+
+    "cursed_key": {
+        "title": "Corrupted Key",
+        "desc": (
+            "The Dungeon Key pulses with a cold glow. A weight presses on your chest—"
+            "a curse tied to an unfulfilled promise. The System warns: 'Penalty may occur.'"
+        ),
+        "choices": {
+            "seek_redemption": {
+                "desc": "Attempt to purify the key.",
+                "result_scene": "reward",
+            },
+            "bury_key": {
+                "desc": "Throw the key away and hope the curse fades.",
+                "result_scene": "intro",
+            },
+        },
+    },
+}
+
+# -------------------------
+# Per-session Userdata
+# -------------------------
 @dataclass
 class Userdata:
-    """👤 User session data"""
-    order: OrderState
-    session_start: datetime = field(default_factory=datetime.now)
+    player_name: Optional[str] = None
+    current_scene: str = "intro"
+    history: List[Dict] = field(default_factory=list)  # list of {'scene', 'action', 'time', 'result_scene'}
+    journal: List[str] = field(default_factory=list)
+    inventory: List[str] = field(default_factory=list)
+    named_npcs: Dict[str, str] = field(default_factory=dict)
+    choices_made: List[str] = field(default_factory=list)
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
 
-# ======================================================
-# 🛠️ BARISTA AGENT FUNCTION TOOLS
-# ======================================================
+# -------------------------
+# Helper functions
+# -------------------------
+def scene_text(scene_key: str, userdata: Userdata) -> str:
+    """
+    Build the descriptive text for the current scene, and append choices as short hints.
+    Always end with 'What do you do?' so the voice flow prompts player input.
+    """
+    scene = WORLD.get(scene_key)
+    if not scene:
+        return "You are in a featureless void. What do you do?"
+
+    desc = f"{scene['desc']}\n\nChoices:\n"
+    for cid, cmeta in scene.get("choices", {}).items():
+        desc += f"- {cmeta['desc']} (say: {cid})\n"
+    # GM MUST end with the action prompt
+    desc += "\nWhat do you do?"
+    return desc
+
+def apply_effects(effects: dict, userdata: Userdata):
+    if not effects:
+        return
+    if "add_journal" in effects:
+        userdata.journal.append(effects["add_journal"])
+    if "add_inventory" in effects:
+        userdata.inventory.append(effects["add_inventory"])
+    # Extendable for more effect keys
+
+def summarize_scene_transition(old_scene: str, action_key: str, result_scene: str, userdata: Userdata) -> str:
+    """Record the transition into history and return a short narrative the GM can use."""
+    entry = {
+        "from": old_scene,
+        "action": action_key,
+        "to": result_scene,
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
+    userdata.history.append(entry)
+    userdata.choices_made.append(action_key)
+    return f"You chose '{action_key}'."
+
+# -------------------------
+# Agent Tools (function_tool)
+# -------------------------
 
 @function_tool
-async def set_drink_type(
+async def start_adventure(
     ctx: RunContext[Userdata],
-    drink: Annotated[
-        Literal["latte", "cappuccino", "americano", "espresso", "mocha", "coffee", "cold brew", "matcha"],
-        Field(description="🎯 The type of coffee drink the customer wants"),
-    ],
+    player_name: Annotated[Optional[str], Field(description="Player name", default=None)] = None,
 ) -> str:
-    """☕ Set the drink type. Call when customer specifies which coffee they want."""
-    ctx.userdata.order.drinkType = drink
-    print(f"✅ DRINK SET: {drink.upper()}")
-    print(f"📊 Order Progress: {ctx.userdata.order.get_summary()}")
-    return f"☕ Excellent choice! One {drink} coming up!"
+    """Initialize a new adventure session for the player and return the opening description."""
+    userdata = ctx.userdata
+    if player_name:
+        userdata.player_name = player_name
+    userdata.current_scene = "intro"
+    userdata.history = []
+    userdata.journal = []
+    userdata.inventory = []
+    userdata.named_npcs = {}
+    userdata.choices_made = []
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
+
+    opening = (
+        f"Greetings {userdata.player_name or 'traveler'}. Welcome to '{WORLD['intro']['title']}'.\n\n"
+        + scene_text("intro", userdata)
+    )
+    # Ensure GM prompt present
+    if not opening.endswith("What do you do?"):
+        opening += "\nWhat do you do?"
+    return opening
 
 @function_tool
-async def set_size(
+async def get_scene(
     ctx: RunContext[Userdata],
-    size: Annotated[
-        Literal["small", "medium", "large", "extra large"],
-        Field(description="📏 The size of the drink"),
-    ],
 ) -> str:
-    """📏 Set the size. Call when customer specifies drink size."""
-    ctx.userdata.order.size = size
-    print(f"✅ SIZE SET: {size.upper()}")
-    print(f"📊 Order Progress: {ctx.userdata.order.get_summary()}")
-    return f"📏 {size.title()} size - perfect for your {ctx.userdata.order.drinkType}!"
+    """Return the current scene description (useful for 'remind me where I am')."""
+    userdata = ctx.userdata
+    scene_k = userdata.current_scene or "intro"
+    txt = scene_text(scene_k, userdata)
+    return txt
 
 @function_tool
-async def set_milk(
+async def player_action(
     ctx: RunContext[Userdata],
-    milk: Annotated[
-        Literal["whole", "skim", "almond", "oat", "soy", "coconut", "none"],
-        Field(description="🥛 The type of milk for the drink"),
-    ],
+    action: Annotated[str, Field(description="Player spoken action or the short action code (e.g., 'inspect_box' or 'take the box')")],
 ) -> str:
-    """🥛 Set milk preference. Call when customer specifies milk type."""
-    ctx.userdata.order.milk = milk
-    print(f"✅ MILK SET: {milk.upper()}")
-    print(f"📊 Order Progress: {ctx.userdata.order.get_summary()}")
-    
-    if milk == "none":
-        return "🥛 Got it! Black coffee - strong and simple!"
-    return f"🥛 {milk.title()} milk - great choice!"
+    """
+    Accept player's action (natural language or action key), try to resolve it to a defined choice,
+    update userdata, advance to the next scene and return the GM's next description (ending with 'What do you do?').
+    """
+    userdata = ctx.userdata
+    current = userdata.current_scene or "intro"
+    scene = WORLD.get(current)
+    action_text = (action or "").strip()
+
+    # Attempt 1: match exact action key (e.g., 'inspect_box')
+    chosen_key = None
+    if action_text.lower() in (scene.get("choices") or {}):
+        chosen_key = action_text.lower()
+
+    # Attempt 2: fuzzy match by checking if action_text contains the choice key or descriptive words
+    if not chosen_key:
+        # try to find a choice whose description words appear in action_text
+        for cid, cmeta in (scene.get("choices") or {}).items():
+            desc = cmeta.get("desc", "").lower()
+            if cid in action_text.lower() or any(w in action_text.lower() for w in desc.split()[:4]):
+                chosen_key = cid
+                break
+
+    # Attempt 3: fallback by simple keyword matching against choice descriptions
+    if not chosen_key:
+        for cid, cmeta in (scene.get("choices") or {}).items():
+            for keyword in cmeta.get("desc", "").lower().split():
+                if keyword and keyword in action_text.lower():
+                    chosen_key = cid
+                    break
+            if chosen_key:
+                break
+
+    if not chosen_key:
+        # If we still can't resolve, ask a clarifying GM response but keep it short and end with prompt.
+        resp = (
+            "I didn't quite catch that action for this situation. Try one of the listed choices or use a simple phrase like 'inspect the box' or 'go to the tower'.\n\n"
+            + scene_text(current, userdata)
+        )
+        return resp
+
+    # Apply the chosen choice
+    choice_meta = scene["choices"].get(chosen_key)
+    result_scene = choice_meta.get("result_scene", current)
+    effects = choice_meta.get("effects", None)
+
+    # Apply effects (inventory/journal, etc.)
+    apply_effects(effects or {}, userdata)
+
+    # Record transition
+    _note = summarize_scene_transition(current, chosen_key, result_scene, userdata)
+
+    # Update current scene
+    userdata.current_scene = result_scene
+
+    # Build narrative reply: echo a short confirmation, then describe next scene
+    next_desc = scene_text(result_scene, userdata)
+
+    # A small flourish so the GM sounds more persona-driven
+    persona_pre = (
+        "The Game Master (a calm, slightly mysterious narrator) replies:\n\n"
+    )
+    reply = f"{persona_pre}{_note}\n\n{next_desc}"
+    # ensure final prompt present
+    if not reply.endswith("What do you do?"):
+        reply += "\nWhat do you do?"
+    return reply
 
 @function_tool
-async def set_extras(
+async def show_journal(
     ctx: RunContext[Userdata],
-    extras: Annotated[
-        list[Literal["sugar", "whipped cream", "caramel", "extra shot", "vanilla", "cinnamon", "honey"]] | None,
-        Field(description="🎯 List of extras, or empty/None for no extras"),
-    ] = None,
 ) -> str:
-    """🎯 Set extras. Call when customer specifies add-ons or says no extras."""
-    ctx.userdata.order.extras = extras if extras else []
-    print(f"✅ EXTRAS SET: {ctx.userdata.order.extras}")
-    print(f"📊 Order Progress: {ctx.userdata.order.get_summary()}")
-    
-    if ctx.userdata.order.extras:
-        return f"🎯 Added {', '.join(ctx.userdata.order.extras)} - making it special!"
-    return "🎯 No extras - keeping it classic and delicious!"
+    userdata = ctx.userdata
+    lines = []
+    lines.append(f"Session: {userdata.session_id} | Started at: {userdata.started_at}")
+    if userdata.player_name:
+        lines.append(f"Player: {userdata.player_name}")
+    if userdata.journal:
+        lines.append("\nJournal entries:")
+        for j in userdata.journal:
+            lines.append(f"- {j}")
+    else:
+        lines.append("\nJournal is empty.")
+    if userdata.inventory:
+        lines.append("\nInventory:")
+        for it in userdata.inventory:
+            lines.append(f"- {it}")
+    else:
+        lines.append("\nNo items in inventory.")
+    lines.append("\nRecent choices:")
+    for h in userdata.history[-6:]:
+        lines.append(f"- {h['time']} | from {h['from']} -> {h['to']} via {h['action']}")
+    lines.append("\nWhat do you do?")
+    return "\n".join(lines)
 
 @function_tool
-async def set_name(
+async def restart_adventure(
     ctx: RunContext[Userdata],
-    name: Annotated[str, Field(description="👤 Customer's name for the order")],
 ) -> str:
-    """👤 Set customer name. Call when customer provides their name."""
-    ctx.userdata.order.name = name.strip().title()
-    print(f"✅ NAME SET: {ctx.userdata.order.name}")
-    print(f"📊 Order Progress: {ctx.userdata.order.get_summary()}")
-    return f"👤 Wonderful, {ctx.userdata.order.name}! Almost ready to complete your order!"
+    """Reset the userdata and start again."""
+    userdata = ctx.userdata
+    userdata.current_scene = "intro"
+    userdata.history = []
+    userdata.journal = []
+    userdata.inventory = []
+    userdata.named_npcs = {}
+    userdata.choices_made = []
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
+    greeting = (
+        "The world resets. A new tide laps at the shore. You stand once more at the beginning.\n\n"
+        + scene_text("intro", userdata)
+    )
+    if not greeting.endswith("What do you do?"):
+        greeting += "\nWhat do you do?"
+    return greeting
 
-@function_tool
-async def complete_order(ctx: RunContext[Userdata]) -> str:
-    """🎉 Finalize and save order to JSON. ONLY call when ALL fields are filled."""
-    order = ctx.userdata.order
-    
-    if not order.is_complete():
-        missing = []
-        if not order.drinkType: missing.append("☕ drink type")
-        if not order.size: missing.append("📏 size")
-        if not order.milk: missing.append("🥛 milk")
-        if order.extras is None: missing.append("🎯 extras")
-        if not order.name: missing.append("👤 name")
-        
-        print(f"❌ CANNOT COMPLETE - Missing: {', '.join(missing)}")
-        return f"🔄 Almost there! Just need: {', '.join(missing)}"
-    
-    print(f"🎉 ORDER READY FOR COMPLETION: {order.get_summary()}")
-    
-    try:
-        save_order_to_json(order)
-        extras_text = f" with {', '.join(order.extras)}" if order.extras else ""
-        
-        print("\n" + "⭐" * 60)
-        print("🎉 ORDER COMPLETED SUCCESSFULLY!")
-        print(f"👤 Customer: {order.name}")
-        print(f"☕ Order: {order.size} {order.drinkType} with {order.milk} milk{extras_text}")
-        print("⭐" * 60 + "\n")
-        
-        return f"""🎉 PERFECT! Your {order.size} {order.drinkType} with {order.milk} milk{extras_text} is confirmed, {order.name}! 
-
-⏰ We're preparing your drink now - it'll be ready in 3-5 minutes!
-
-📺 **Thanks for using our AI Barista!** """
-        
-    except Exception as e:
-        print(f"❌ ORDER SAVE FAILED: {e}")
-        return "⚠️ Order recorded but there was a small issue. Don't worry, we'll make your drink right away!"
-
-@function_tool
-async def get_order_status(ctx: RunContext[Userdata]) -> str:
-    """📊 Get current order status. Call when customer asks about their order."""
-    order = ctx.userdata.order
-    if order.is_complete():
-        return f"📊 Your order is complete! {order.get_summary()}"
-    
-    progress = order.get_summary()
-    return f"📊 Order in progress: {progress}"
-
-class BaristaAgent(Agent):
+# -------------------------
+# The Agent (GameMasterAgent)
+# -------------------------
+class GameMasterAgent(Agent):
     def __init__(self):
+        # System instructions define Universe, Tone, Role
+        instructions = """
+        You are 'sung jinwoo', the Game Master (GM) for a voice-only, Solo-Leveling–style dungeon adventure.
+        
+        Universe: A world of Gates, Dungeons, mana beasts, hunters, relics, and shifting mana anomalies.
+                  The setting begins inside a newly formed low-rank Gate near an abandoned hunter outpost.
+        
+        Tone: Mysterious, dramatic, immersive, but not overly dark. Speak like a seasoned hunter guiding a rookie.
+              Keep tension present, but avoid excessive horror. Prioritize clarity for voice gameplay.
+        
+        Role: You are the GM. You vividly describe dungeon scenes, mana flows, gates, enemies, loot, and System echoes.
+              You must remember the player's past actions, inventory, relics, key items, and dungeon progression.
+              Always guide the story and always end your message with: 'What do you do?'
+
+        Rules:
+            - Use the provided tools to start the adventure, get the current dungeon scene, accept the player's action,
+              access the player's journal, or restart the dungeon run.
+            - Maintain continuity using session userdata: reference the player's acquired relics, keys, maps,
+              and any System messages they have uncovered.
+            - Aim for short, meaningful turns just like a fast-paced Solo-Leveling arc.
+            - Each GM message MUST end with 'What do you do?'.
+            - Since this is voice-first, keep responses crisp, vivid, and easy to follow.
+        """
         super().__init__(
-            instructions="""
-            🏪 You are a FRIENDLY and PROFESSIONAL barista at "coffee wala".
-            
-            🎯 MISSION: Take coffee orders by systematically collecting:
-            ☕ Drink Type: latte, cappuccino, americano, espresso, mocha, coffee, cold brew, matcha
-            📏 Size: small, medium, large, extra large
-            🥛 Milk: whole, skim, almond, oat, soy, coconut, none
-            🎯 Extras: sugar, whipped cream, caramel, extra shot, vanilla, cinnamon, honey, or none
-            👤 Customer Name: for the order
-            
-            📝 PROCESS:
-            1. Greet warmly and ask for drink type
-            2. Ask for size preference  
-            3. Ask for milk choice
-            4. Ask about extras
-            5. Get customer name
-            6. Confirm and complete order
-            
-            🎨 STYLE:
-            - Be warm, enthusiastic, and professional
-            - Use emojis to make it friendly
-            - Ask one question at a time
-            - Confirm choices as you go
-            - Celebrate when order is complete
-            
-            🛠️ Use the function tools to record each piece of information.
-            """,
-            tools=[
-                set_drink_type,
-                set_size,
-                set_milk,
-                set_extras,
-                set_name,
-                complete_order,
-                get_order_status,
-            ],
+            instructions=instructions,
+            tools=[start_adventure, get_scene, player_action, show_journal, restart_adventure],
         )
 
-def create_empty_order():
-    """🆕 Create a fresh order state"""
-    return OrderState()
-
-# ======================================================
-# 💾 ORDER STORAGE & PERSISTENCE
-# ======================================================
-def get_orders_folder():
-    """📁 Get the orders directory path"""
-    base_dir = os.path.dirname(__file__)   # src/
-    backend_dir = os.path.abspath(os.path.join(base_dir, ".."))
-    folder = os.path.join(backend_dir, "orders")
-    os.makedirs(folder, exist_ok=True)
-    return folder
-
-def save_order_to_json(order: OrderState) -> str:
-    """💾 Save order to JSON file with enhanced logging"""
-    print(f"\n🔄 ATTEMPTING TO SAVE ORDER...")
-    folder = get_orders_folder()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"order_{timestamp}.json"
-    path = os.path.join(folder, filename)
-
-    try:
-        order_data = order.to_dict()
-        order_data["timestamp"] = datetime.now().isoformat()
-        order_data["session_id"] = f"session_{timestamp}"
-        
-        with open(path, "w", encoding='utf-8') as f:
-            json.dump(order_data, f, indent=4, ensure_ascii=False)
-        
-        print("\n" + "✅" * 30)
-        print("🎉 ORDER SAVED SUCCESSFULLY!")
-        print(f"📁 Location: {path}")
-        print(f"👤 Customer: {order.name}")
-        print(f"☕ Order: {order.get_summary()}")
-        print("✅" * 30 + "\n")
-        
-        return path
-        
-    except Exception as e:
-        print(f"\n❌ CRITICAL ERROR SAVING ORDER: {e}")
-        print(f"📁 Attempted path: {path}")
-        print("🚨 Please check directory permissions!")
-        raise e
-
-# ======================================================
-# 🧪 SYSTEM VALIDATION & TESTING
-# ======================================================
-def test_order_saving():
-    """🧪 Test function to verify order saving works"""
-    print("\n🧪 RUNNING ORDER SAVING TEST...")
-    
-    test_order = OrderState()
-    test_order.drinkType = "latte"
-    test_order.size = "medium"
-    test_order.milk = "oat"
-    test_order.extras = ["extra shot", "vanilla"]
-    test_order.name = "TestCustomer"
-    
-    try:
-        path = save_order_to_json(test_order)
-        print(f"🎯 TEST RESULT: ✅ SUCCESS - Saved to {path}")
-        return True
-    except Exception as e:
-        print(f"🎯 TEST RESULT: ❌ FAILED - {e}")
-        return False
-
-# ======================================================
-# 🔧 SYSTEM INITIALIZATION & PREWARMING
-# ======================================================
+# -------------------------
+# Entrypoint & Prewarm (keeps speech functionality)
+# -------------------------
 def prewarm(proc: JobProcess):
-    """🔥 Preload VAD model for better performance"""
-    print("🔥 Prewarming VAD model...")
-    proc.userdata["vad"] = silero.VAD.load()
-    print("✅ VAD model loaded successfully!")
+    # load VAD model and stash on process userdata, try/catch like original file
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
 
-# ======================================================
-# 🎬 AGENT SESSION MANAGEMENT
-# ======================================================
 async def entrypoint(ctx: JobContext):
-    """🎬 Main agent entrypoint - handles customer sessions"""
     ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info("\n" + "🎲" * 8)
+    logger.info("🚀 STARTING VOICE GAME MASTER (Brinmere Mini-Arc)")
 
-    # Run test to verify everything works
-    test_order_saving()
+    userdata = Userdata()
 
-    # Create user session data with empty order
-    userdata = Userdata(order=create_empty_order())
-    
-    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"\n🆕 NEW CUSTOMER SESSION: {session_id}")
-    print(f"📝 Initial order state: {userdata.order.get_summary()}\n")
-
-    # Create session with userdata
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-matthew",
-            style="Conversation",
+            voice="en-US-marcus",
+            style="Conversational",
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        userdata=userdata,  # Pass userdata to session
+        vad=ctx.proc.userdata.get("vad"),
+        userdata=userdata,
     )
 
-    # Metrics collection
-    usage_collector = metrics.UsageCollector()
-    @session.on("metrics_collected")
-    def _on_metrics(ev: MetricsCollectedEvent):
-        usage_collector.collect(ev.metrics)
-
+    # Start the agent session with the GameMasterAgent
     await session.start(
-        agent=BaristaAgent(),
+        agent=GameMasterAgent(),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC()
-        ),
+        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
 
     await ctx.connect()
 
-# ======================================================
-# ⚡ APPLICATION BOOTSTRAP & LAUNCH
-# ======================================================
 if __name__ == "__main__":
-    
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
